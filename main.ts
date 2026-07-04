@@ -18,8 +18,10 @@
 
 const ALLOWED_MODEL = "claude-haiku-4-5";
 const MAX_TOKENS = 400;
-const RL_PER_IP = 100;    // max AI calls per IP per 10-minute window
-const RL_PER_DAY = 1000;  // max total AI calls per UTC day (bounds Anthropic spend)
+const MAX_BODY_BYTES = 32768; // legit peak ≈ 15KB (system + full-night history); blocks giant-input cost bombs
+const RL_PER_IP = 100;        // max AI calls per IP per 10-minute window
+const RL_PER_IP_DAY = 300;    // max AI calls per IP per UTC day (one abuser can't eat the global budget)
+const RL_PER_DAY = 1000;      // max total AI calls per UTC day (bounds Anthropic spend)
 const CORS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
@@ -157,10 +159,14 @@ async function rateLimited(req: Request): Promise<Response | null> {
   const now = Date.now();
   const ipKey = ["rl_ip", ip, Math.floor(now / 600000)];   // 10-minute window
   const dayKey = ["rl_day", Math.floor(now / 86400000)];   // UTC day
+  const ipDayKey = ["rl_ip_day", ip, Math.floor(now / 86400000)];
   try {
     const ipCount = (Number((await kv.get(ipKey)).value) || 0) + 1;
     await kv.set(ipKey, ipCount, { expireIn: 660000 });      // ~11 min
     if (ipCount > RL_PER_IP) return json({ error: "rate limited: too many requests, slow down" }, 429);
+    const ipDayCount = (Number((await kv.get(ipDayKey)).value) || 0) + 1;
+    await kv.set(ipDayKey, ipDayCount, { expireIn: 90000000 });
+    if (ipDayCount > RL_PER_IP_DAY) return json({ error: "daily limit reached for this address" }, 429);
     const dayCount = (Number((await kv.get(dayKey)).value) || 0) + 1;
     await kv.set(dayKey, dayCount, { expireIn: 90000000 });  // ~25 h
     if (dayCount > RL_PER_DAY) return json({ error: "daily limit reached, try again tomorrow" }, 429);
@@ -180,9 +186,14 @@ Deno.serve(async (req: Request) => {
   const limited = await rateLimited(req);
   if (limited) return limited;
 
+  // Input-size clamp: max_tokens alone doesn't bound cost — INPUT tokens do.
+  // Without this, a scripted 200k-token payload costs ~$0.20/call and can burn
+  // the monthly spend cap in minutes.
+  const rawBody = await req.text();
+  if (rawBody.length > MAX_BODY_BYTES) return json({ error: "request too large" }, 413);
   let body: Record<string, unknown>;
   try {
-    body = await req.json();
+    body = JSON.parse(rawBody);
   } catch {
     return json({ error: "bad json" }, 400);
   }
